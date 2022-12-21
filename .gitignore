@@ -1,3 +1,4 @@
 credentials.json
 newest_id_file.txt
 token.pickle
+.env

@@ -1,12 +1,18 @@
 from __future__ import print_function
 import time #Measure execution time
-from datetime import datetime
 import pickle
 import os.path
 import requests
+import piexif
+import pytz
+from PIL import Image
+from datetime import datetime, timedelta
+from dotenv import load_dotenv 
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+
+load_dotenv()
 
 #Generator that yields a photo from an album.
 def get_photos(service, album_id, page_size):
@@ -24,7 +30,19 @@ def get_photos(service, album_id, page_size):
         if response.get('nextPageToken') is None:
             break
 
-# AUTH Code Found Here: https://stackoverflow.com/questions/58928685/google-photos-api-python-working-non-deprecated-example
+#Converts UTC date to PT date with specific date format. Accounts for daylight savings
+def utc_to_pt(utc_string):
+    utc_timezone = pytz.timezone("UTC")
+    date = utc_timezone.localize(datetime.strptime(utc_string, "%Y-%m-%dT%H:%M:%SZ"))
+
+    pt_timezone = pytz.timezone("US/Pacific")
+
+    #Convert UTC to PT
+    pt_date = date.astimezone(pt_timezone)
+
+    return pt_date.strftime("%Y:%m:%d %H:%M:%S")
+
+#AUTH Code Found Here: https://stackoverflow.com/questions/58928685/google-photos-api-python-working-non-deprecated-example
 
 credentialsFile = 'credentials.json' 
 pickleFile = 'token.pickle' 
@@ -45,16 +63,18 @@ if not creds or not creds.valid:
         pickle.dump(creds, token)
 
 service = build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
-request = service.mediaItems().list(pageSize=30)
+request = service.mediaItems().list(pageSize=30) #Can modify as needed. Assumes only 30 new photos have been uploaded.
 response = request.execute()
 
 photos = response['mediaItems']
 
 last_updated_index = None
 last_updated_id = None
+
 with open('newest_id_file.txt') as f:
     last_updated_id = f.read()
 
+#Find the index of the last updated photo
 for index, dic in enumerate(photos):
     if dic['id'] == last_updated_id:
         last_updated_index = index
@@ -62,7 +82,7 @@ for index, dic in enumerate(photos):
     else:
         last_updated_index = -1
     
-photos = photos[:last_updated_index+1]
+photos = photos[:last_updated_index+1] #Slice the list to save space.
 
 #Patch for albumId not being a valid arg: https://github.com/googleapis/google-api-python-client/issues/733
 search_params = {
@@ -89,17 +109,18 @@ search_params = {
   }
 }
 
-request = service.albums().list(pageSize=30)
+request = service.albums().list(pageSize=30) #Only need 30 items since there are only 28 albums currently. Might change this later to reflect pageToken stuff.
 response = request.execute()
 
 albums = response['albums']
-print(len(albums))
 
 service._resourceDesc['resources']['mediaItems']['methods']['search']['parameters'].update(search_params)
 
 albums_of_new_photos = []
 
 album_media = []
+
+# print(photos[1]) #DEBUG LINE
 
 start_time = time.time()
 
@@ -111,23 +132,26 @@ for i in range(len(albums)):
         album_content.append(content)
     
     album_media.append(album_content)
-album_titles = []
+ 
+album_titles = [] #List of album titles that a certain photo belongs to.
 
-for i in range(last_updated_index+2): # Iterate through each photo
+for i in range(last_updated_index+2): # Iterate through each photo.
 
-    #Add the list of album titles photo is in to the total list of albums every photo is in
+    #Add the list of album titles that a photo is in to the total list of albums with each index being the index of the photo.
     if(album_titles):
-            albums_of_new_photos.append(album_titles)
-    album_titles = []
+        albums_of_new_photos.append(album_titles)
 
-    #Required since the last iteration will be skipped (hence the last_updated_index+2 in the above)
+    album_titles = [] #Reset after each iteration
+
+    #Required since the last iteration will be skipped (hence the last_updated_index+2 in the above).
     if(i == last_updated_index+1):
         break
 
     for j in range(len(albums)): # Iterate through each album
 
-        # Not sure if this line will be needed at all since sort time might be too slow
-        #album_content = sorted(album_content, key = lambda p: datetime.strptime(p['mediaMetadata']['creationTime'], '%Y-%m-%dT%H:%M:%SZ'), reverse=True)
+        #Not sure if this line will be needed at all since sort time might have be too slow or have
+        #negligible changes on timing.
+        # album_content = sorted(album_content, key = lambda p: datetime.strptime(p['mediaMetadata']['creationTime'], '%Y-%m-%dT%H:%M:%SZ'), reverse=True)
         
         #Find out if photo is in the album
         for dic in album_media[j]:
@@ -144,20 +168,55 @@ for i in range(last_updated_index+2): # Iterate through each photo
             album_titles = ['Videos']
             break
 
-# Filter out the empty lists
 print(time.time() - start_time)
-albums_of_new_photos  = [["Group Stuff"] if len(l) == 2 else l for l in albums_of_new_photos]
-print(albums_of_new_photos)
-# file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 
-# # for i in range(last_updated_index+1):
-# for i in range(2):
-#     request = service.mediaItems().get(mediaItemId=photos[i]['id'])
-#     response = request.execute()
+#Takes care of duo photos here instead of the loop due to ordering issues
+albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_of_new_photos]
+print(albums_of_new_photos) #DEBUG line
+
+file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
+
+#EXIF numerical tag values 
+DateTimeOriginal = 36867
+DateTimeDigitized = 36868
+
+#Download all photos/videos and change the dates/titles for them to match up
+for i in range(last_updated_index+1):
+    request = service.mediaItems().get(mediaItemId=photos[i]['id'])
+    response = request.execute()
     
-#     photo_url = response['baseUrl']
-#     response = requests.get(photo_url)
+    if(albums_of_new_photos[i] == "Videos"):
+        media_url = response['baseUrl'] + '=dv' #Need this "=dv" for downloading video properly
+    else:
+        media_url = response['baseUrl'] + '=d' #Need this "=d" for downloading full quality 
 
-#     with open(file_dir + photos[i]['filename'], 'wb') as f:
-#         f.write(response.content)
+    response = requests.get(media_url)
+    photo = response.content
+    
+    with open(file_dir + photos[i]['filename'], 'wb') as f:
+        f.write(photo)
+
+        #NOTE: Maybe change video title to fit in with the rest of the videos
+        if(albums_of_new_photos[i] == "Videos"):
+            pass
+        else:
+            im = Image.open(file_dir + photos[i]['filename'])
+
+            try:
+                exif_dict = im.info['exif']
+            except KeyError: 
+                print(f"Image {photos[i]['filename']} did not have EXIF data")
+            else:
+                #Apply correct date from metadata
+                exif_dict = piexif.load(exif_dict)
+                actual_date =  utc_to_pt(photos[i]['mediaMetadata']['creationTime'])
+                encoded_date = actual_date.encode('utf-8')
+                exif_dict['Exif'][DateTimeOriginal] = encoded_date
+                exif_dict['Exif'][DateTimeDigitized] = encoded_date
+
+                #Apply changes to photos
+                exif_bytes = piexif.dump(exif_dict)
+                piexif.insert(exif_bytes, file_dir + photos[i]['filename'])
+
+
 
