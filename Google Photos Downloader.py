@@ -1,7 +1,7 @@
 from __future__ import print_function
 import time #Measure execution time
 import pickle
-import os.path
+import os
 import requests
 import piexif
 import pytz
@@ -31,7 +31,7 @@ def get_photos(service, album_id, page_size):
             break
 
 #Converts UTC date to PT date with specific date format. Accounts for daylight savings
-def utc_to_pt(utc_string):
+def utc_to_pt(utc_string,format="%Y:%m:%d %H:%M:%S"):
     utc_timezone = pytz.timezone("UTC")
     date = utc_timezone.localize(datetime.strptime(utc_string, "%Y-%m-%dT%H:%M:%SZ"))
 
@@ -40,7 +40,7 @@ def utc_to_pt(utc_string):
     #Convert UTC to PT
     pt_date = date.astimezone(pt_timezone)
 
-    return pt_date.strftime("%Y:%m:%d %H:%M:%S")
+    return pt_date.strftime(format)
 
 #AUTH Code Found Here: https://stackoverflow.com/questions/58928685/google-photos-api-python-working-non-deprecated-example
 
@@ -180,6 +180,8 @@ file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 DateTimeOriginal = 36867
 DateTimeDigitized = 36868
 
+list_no_exif = []
+
 #Download all photos/videos and change the dates/titles for them to match up
 for i in range(last_updated_index+1):
     request = service.mediaItems().get(mediaItemId=photos[i]['id'])
@@ -192,31 +194,67 @@ for i in range(last_updated_index+1):
 
     response = requests.get(media_url)
     photo = response.content
+
+    is_video = False
+    no_exif = False
+    filename = photos[i]['filename']
+    creation_time = photos[i]['mediaMetadata']['creationTime']
     
-    with open(file_dir + photos[i]['filename'], 'wb') as f:
+    with open(file_dir + filename, 'wb') as f:
         f.write(photo)
 
-        #NOTE: Maybe change video title to fit in with the rest of the videos
         if(albums_of_new_photos[i] == "Videos"):
+            is_video = True
             pass
         else:
-            im = Image.open(file_dir + photos[i]['filename'])
+            im = Image.open(file_dir + filename)
 
             try:
                 exif_dict = im.info['exif']
-            except KeyError: 
-                print(f"Image {photos[i]['filename']} did not have EXIF data")
+            except KeyError: #Some photos may not have EXIF data
+                list_no_exif.append((filename,utc_to_pt(creation_time)))
+                no_exif = True
             else:
                 #Apply correct date from metadata
                 exif_dict = piexif.load(exif_dict)
-                actual_date =  utc_to_pt(photos[i]['mediaMetadata']['creationTime'])
+                actual_date =  utc_to_pt(creation_time)
                 encoded_date = actual_date.encode('utf-8')
                 exif_dict['Exif'][DateTimeOriginal] = encoded_date
                 exif_dict['Exif'][DateTimeDigitized] = encoded_date
 
                 #Apply changes to photos
                 exif_bytes = piexif.dump(exif_dict)
-                piexif.insert(exif_bytes, file_dir + photos[i]['filename'])
+                piexif.insert(exif_bytes, file_dir + filename)
+
+    if(is_video):
+        #The following uses replace instead of rename since replace accounts for already existing files
+        actual_date =  utc_to_pt(creation_time,"%Y-%m-%d %H.%M.%S")
+        os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.find('.'):])
+    elif(no_exif):
+        actual_date =  utc_to_pt(creation_time)
+        exif_dict = {
+                    "0th":{},
+                    "Exif": {
+                        DateTimeOriginal: actual_date,
+                        DateTimeDigitized: actual_date
+                    },
+                    "GPS":{},
+                    "Interop":{},
+                    "1st":{},
+                    "thumbnail":None
+        }
+        exif_bytes = piexif.dump(exif_dict)
+        im.save(file_dir + filename, exif=exif_bytes) #Note this will remove most of the metadata
+
+#Still need to see if the issue of EXIF date not being used can be fixed.
+#Could be due to not enough EXIF data being supplied
+if(list_no_exif):
+    print(f"The following images had no EXIF data and data was created automatically. Date may still need to be modified manually:")
+    for i in range(len(list_no_exif)):
+        print(list_no_exif[i][0] + "-> Creation Time: " + list_no_exif[i][1])
+
+
+
 
 
 
