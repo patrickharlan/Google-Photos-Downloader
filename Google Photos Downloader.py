@@ -6,7 +6,8 @@ import requests
 import piexif
 import pytz
 from PIL import Image
-from datetime import datetime, timedelta
+from datetime import datetime
+from alive_progress import alive_bar
 from dotenv import load_dotenv 
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -122,16 +123,18 @@ album_media = []
 
 # print(photos[1]) #DEBUG LINE
 
-start_time = time.time()
-
 #Get a list of photos from each album and put them in a list.
-for i in range(len(albums)):
-    album_content = []
+with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
 
-    for content in get_photos(service, albums[i]['id'],20):
-        album_content.append(content)
+    for i in range(len(albums)):
+        bar.text = '-> Loading album content, please wait...'
+        album_content = []
+
+        for content in get_photos(service, albums[i]['id'],20):
+            album_content.append(content)
     
-    album_media.append(album_content)
+        album_media.append(album_content)
+        bar()
  
 album_titles = [] #List of album titles that a certain photo belongs to.
 
@@ -168,11 +171,9 @@ for i in range(last_updated_index+2): # Iterate through each photo.
             album_titles = ['Videos']
             break
 
-print(time.time() - start_time)
-
 #Takes care of duo photos here instead of the loop due to ordering issues
 albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_of_new_photos]
-print(albums_of_new_photos) #DEBUG line
+# print(albums_of_new_photos) #DEBUG line
 
 file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 
@@ -183,68 +184,75 @@ DateTimeDigitized = 36868
 list_no_exif = []
 
 #Download all photos/videos and change the dates/titles for them to match up
-for i in range(last_updated_index+1):
-    request = service.mediaItems().get(mediaItemId=photos[i]['id'])
-    response = request.execute()
-    
-    if(albums_of_new_photos[i] == "Videos"):
-        media_url = response['baseUrl'] + '=dv' #Need this "=dv" for downloading video properly
-    else:
-        media_url = response['baseUrl'] + '=d' #Need this "=d" for downloading full quality 
+with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=10) as bar:
+    for i in range(last_updated_index+1):
+        bar.text = "-> Downloading photos, please wait..."
+        request = service.mediaItems().get(mediaItemId=photos[i]['id'])
+        response = request.execute()
 
-    response = requests.get(media_url)
-    photo = response.content
-
-    is_video = False
-    no_exif = False
-    filename = photos[i]['filename']
-    creation_time = photos[i]['mediaMetadata']['creationTime']
-    
-    with open(file_dir + filename, 'wb') as f:
-        f.write(photo)
-
-        if(albums_of_new_photos[i] == "Videos"):
-            is_video = True
-            pass
+        if (albums_of_new_photos[i] == "Videos"):
+            # Need this "=dv" for downloading video properly
+            media_url = response['baseUrl'] + '=dv'
         else:
-            im = Image.open(file_dir + filename)
+            # Need this "=d" for downloading full quality
+            media_url = response['baseUrl'] + '=d'
 
-            try:
-                exif_dict = im.info['exif']
-            except KeyError: #Some photos may not have EXIF data
-                list_no_exif.append((filename,utc_to_pt(creation_time)))
-                no_exif = True
+        response = requests.get(media_url)
+        photo = response.content
+
+        is_video = False
+        no_exif = False
+        filename = photos[i]['filename']
+        creation_time = photos[i]['mediaMetadata']['creationTime']
+
+        with open(file_dir + filename, 'wb') as f:
+            f.write(photo)
+
+            if (albums_of_new_photos[i] == "Videos"):
+                is_video = True
+                pass
             else:
-                #Apply correct date from metadata
-                exif_dict = piexif.load(exif_dict)
-                actual_date =  utc_to_pt(creation_time)
-                encoded_date = actual_date.encode('utf-8')
-                exif_dict['Exif'][DateTimeOriginal] = encoded_date
-                exif_dict['Exif'][DateTimeDigitized] = encoded_date
+                im = Image.open(file_dir + filename)
 
-                #Apply changes to photos
-                exif_bytes = piexif.dump(exif_dict)
-                piexif.insert(exif_bytes, file_dir + filename)
+                try:
+                    exif_dict = im.info['exif']
+                except KeyError:  # Some photos may not have EXIF data
+                    list_no_exif.append((filename, utc_to_pt(creation_time)))
+                    no_exif = True
+                else:
+                    # Apply correct date from metadata
+                    exif_dict = piexif.load(exif_dict)
+                    actual_date = utc_to_pt(creation_time)
+                    encoded_date = actual_date.encode('utf-8')
+                    exif_dict['Exif'][DateTimeOriginal] = encoded_date
+                    exif_dict['Exif'][DateTimeDigitized] = encoded_date
 
-    if(is_video):
-        #The following uses replace instead of rename since replace accounts for already existing files
-        actual_date =  utc_to_pt(creation_time,"%Y-%m-%d %H.%M.%S")
-        os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.find('.'):])
-    elif(no_exif):
-        actual_date =  utc_to_pt(creation_time)
-        exif_dict = {
-                    "0th":{},
-                    "Exif": {
-                        DateTimeOriginal: actual_date,
-                        DateTimeDigitized: actual_date
-                    },
-                    "GPS":{},
-                    "Interop":{},
-                    "1st":{},
-                    "thumbnail":None
-        }
-        exif_bytes = piexif.dump(exif_dict)
-        im.save(file_dir + filename, exif=exif_bytes) #Note this will remove most of the metadata
+                    # Apply changes to photos
+                    exif_bytes = piexif.dump(exif_dict)
+                    piexif.insert(exif_bytes, file_dir + filename)
+
+        if (is_video):
+            # The following uses replace instead of rename since replace accounts for already existing files
+            actual_date = utc_to_pt(creation_time, "%Y-%m-%d %H.%M.%S")
+            os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.find('.'):])
+        elif (no_exif):
+            actual_date = utc_to_pt(creation_time)
+            exif_dict = {
+                "0th": {},
+                "Exif": {
+                    DateTimeOriginal: actual_date,
+                    DateTimeDigitized: actual_date
+                },
+                "GPS": {},
+                "Interop": {},
+                "1st": {},
+                "thumbnail": None
+            }
+            exif_bytes = piexif.dump(exif_dict)
+            # Note this will remove most of the metadata
+            im.save(file_dir + filename, exif=exif_bytes)
+        
+        bar()
 
 #Still need to see if the issue of EXIF date not being used can be fixed.
 #Could be due to not enough EXIF data being supplied
