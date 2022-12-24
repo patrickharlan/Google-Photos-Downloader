@@ -1,6 +1,7 @@
 from __future__ import print_function
-import time #Measure execution time
 import pickle
+import time
+import subprocess
 import os
 import requests
 import piexif
@@ -12,6 +13,16 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+
+#TO DO:
+#-Automatic sorting of photos to respective folders (env file).
+#-Possible scenario of JPG or HEIC having no EXIF data (Experimentation needed).
+#-Updating the newest_id_file.
+#-Code cleanup.
+
+#Possible Implementations:
+#-GUI (ABSOLUTE LAST)
+#-Renaming photos to date taken for better organization
 
 load_dotenv()
 
@@ -84,6 +95,7 @@ for index, dic in enumerate(photos):
         last_updated_index = -1
     
 photos = photos[:last_updated_index+1] #Slice the list to save space.
+print(last_updated_index)
 
 #Patch for albumId not being a valid arg: https://github.com/googleapis/google-api-python-client/issues/733
 search_params = {
@@ -141,8 +153,12 @@ album_titles = [] #List of album titles that a certain photo belongs to.
 for i in range(last_updated_index+2): # Iterate through each photo.
 
     #Add the list of album titles that a photo is in to the total list of albums with each index being the index of the photo.
-    if(album_titles):
+    if(album_titles and i > 0):
         albums_of_new_photos.append(album_titles)
+    elif (i > 0): #Without this the entire list would be shifted
+        albums_of_new_photos.append(["Not in any album"])
+    else:
+        pass
 
     album_titles = [] #Reset after each iteration
 
@@ -177,10 +193,6 @@ albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_
 
 file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 
-#EXIF numerical tag values 
-DateTimeOriginal = 36867
-DateTimeDigitized = 36868
-
 list_no_exif = []
 
 #Download all photos/videos and change the dates/titles for them to match up
@@ -190,11 +202,10 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
         request = service.mediaItems().get(mediaItemId=photos[i]['id'])
         response = request.execute()
 
+        #The '=dv' and '=d' download the videos and photos respectively in full quality and properly
         if (albums_of_new_photos[i] == "Videos"):
-            # Need this "=dv" for downloading video properly
             media_url = response['baseUrl'] + '=dv'
         else:
-            # Need this "=d" for downloading full quality
             media_url = response['baseUrl'] + '=d'
 
         response = requests.get(media_url)
@@ -222,10 +233,11 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 else:
                     # Apply correct date from metadata
                     exif_dict = piexif.load(exif_dict)
-                    actual_date = utc_to_pt(creation_time)
+                    piexif.remove(file_dir + filename)
+                    actual_date = utc_to_pt(creation_time) #NOTE:Should just call this once outside "with open".
                     encoded_date = actual_date.encode('utf-8')
-                    exif_dict['Exif'][DateTimeOriginal] = encoded_date
-                    exif_dict['Exif'][DateTimeDigitized] = encoded_date
+                    exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = encoded_date
+                    exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = encoded_date
 
                     # Apply changes to photos
                     exif_bytes = piexif.dump(exif_dict)
@@ -240,8 +252,8 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
             exif_dict = {
                 "0th": {},
                 "Exif": {
-                    DateTimeOriginal: actual_date,
-                    DateTimeDigitized: actual_date
+                    piexif.ExifIFD.DateTimeOriginal: actual_date,
+                    piexif.ExifIFD.DateTimeDigitized: actual_date
                 },
                 "GPS": {},
                 "Interop": {},
@@ -249,17 +261,22 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 "thumbnail": None
             }
             exif_bytes = piexif.dump(exif_dict)
-            # Note this will remove most of the metadata
+            #Note this will remove most of the metadata. Might change this to use exiftool.
+            #Exiftool takes longer to execute thus piexif is still used.
             im.save(file_dir + filename, exif=exif_bytes)
+            im.close() #Could duplicate this over to other parts
+            #Only way to properly change the PNG time which is used by Windows instead of the new EXIF for some reason.
+            #Still need to test this on other files with no EXIF (e.g JPG and HEIC).
+            subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir+filename],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         bar()
 
-#Still need to see if the issue of EXIF date not being used can be fixed.
-#Could be due to not enough EXIF data being supplied
 if(list_no_exif):
-    print(f"The following images had no EXIF data and data was created automatically. Date may still need to be modified manually:")
+    print(f"The following images had no EXIF data and data was created automatically")
     for i in range(len(list_no_exif)):
-        print(list_no_exif[i][0] + "-> Creation Time: " + list_no_exif[i][1])
+        print(list_no_exif[i][0] + "-> Date Taken: " + list_no_exif[i][1])
+    print("NOTE: PNG images may use the tag of CreationTime instead of the supplied EXIF. This is accounted for.")
 
 
 
