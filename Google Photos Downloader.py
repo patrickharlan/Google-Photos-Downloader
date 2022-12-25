@@ -2,6 +2,8 @@ from __future__ import print_function
 import pickle
 import time
 import subprocess
+import json
+import sys
 import os
 import requests
 import piexif
@@ -16,13 +18,13 @@ from google.auth.transport.requests import Request
 
 #TO DO:
 #-Automatic sorting of photos to respective folders (env file).
-#-Possible scenario of JPG or HEIC having no EXIF data (Experimentation needed).
-#-Updating the newest_id_file.
+#-Add code that detects if old photos were added (old meaning they are older datewise than the most recent photo).
+# This could just be a photo between the most photo and the photo recorded by the last_updated index.
+#-Implement album json file check which stores sizes of albums and checks if their sizes have changed. Should speed up things
 #-Code cleanup.
 
 #Possible Implementations:
 #-GUI (ABSOLUTE LAST)
-#-Renaming photos to date taken for better organization
 
 load_dotenv()
 
@@ -86,16 +88,20 @@ last_updated_id = None
 with open('newest_id_file.txt') as f:
     last_updated_id = f.read()
 
-#Find the index of the last updated photo
+#Find the index of the last updated photo. The first element in photos is the most recent photo
 for index, dic in enumerate(photos):
     if dic['id'] == last_updated_id:
         last_updated_index = index
         break
     else:
         last_updated_index = -1
-    
-photos = photos[:last_updated_index+1] #Slice the list to save space.
+
 print(last_updated_index)
+if(last_updated_index == 0):
+    print("No new photos have been uploaded. Script exited.")
+    sys.exit()
+    
+photos = photos[:last_updated_index+1]
 
 #Patch for albumId not being a valid arg: https://github.com/googleapis/google-api-python-client/issues/733
 search_params = {
@@ -133,7 +139,17 @@ albums_of_new_photos = []
 
 album_media = []
 
-# print(photos[1]) #DEBUG LINE
+album_size_dict = {}
+
+if(os.path.exists('albums_sizes.json')):
+    with open('albums_sizes.json', 'r') as f:
+        album_size_dict = json.load(f)
+else:
+    for i in range(len(albums)):
+        album_size_dict[albums[i]['id']] = albums[i]['mediaItemsCount']
+    with open('albums_sizes.json', 'w') as f:
+        json.dump(album_size_dict,f)
+        
 
 #Get a list of photos from each album and put them in a list.
 with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
@@ -167,10 +183,6 @@ for i in range(last_updated_index+2): # Iterate through each photo.
         break
 
     for j in range(len(albums)): # Iterate through each album
-
-        #Not sure if this line will be needed at all since sort time might have be too slow or have
-        #negligible changes on timing.
-        # album_content = sorted(album_content, key = lambda p: datetime.strptime(p['mediaMetadata']['creationTime'], '%Y-%m-%dT%H:%M:%SZ'), reverse=True)
         
         #Find out if photo is in the album
         for dic in album_media[j]:
@@ -189,11 +201,11 @@ for i in range(last_updated_index+2): # Iterate through each photo.
 
 #Takes care of duo photos here instead of the loop due to ordering issues
 albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_of_new_photos]
-# print(albums_of_new_photos) #DEBUG line
 
 file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 
 list_no_exif = []
+list_no_album = []
 
 #Download all photos/videos and change the dates/titles for them to match up
 with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=10) as bar:
@@ -213,8 +225,13 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
 
         is_video = False
         no_exif = False
+        no_album = False
         filename = photos[i]['filename']
         creation_time = photos[i]['mediaMetadata']['creationTime']
+        actual_date = utc_to_pt(creation_time)
+
+        if (albums_of_new_photos[i] == "Not in any album"):
+            list_no_album.append(filename)
 
         with open(file_dir + filename, 'wb') as f:
             f.write(photo)
@@ -228,13 +245,12 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 try:
                     exif_dict = im.info['exif']
                 except KeyError:  # Some photos may not have EXIF data
-                    list_no_exif.append((filename, utc_to_pt(creation_time)))
+                    list_no_exif.append((filename, actual_date))
                     no_exif = True
                 else:
                     # Apply correct date from metadata
                     exif_dict = piexif.load(exif_dict)
                     piexif.remove(file_dir + filename)
-                    actual_date = utc_to_pt(creation_time) #NOTE:Should just call this once outside "with open".
                     encoded_date = actual_date.encode('utf-8')
                     exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = encoded_date
                     exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = encoded_date
@@ -243,12 +259,7 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                     exif_bytes = piexif.dump(exif_dict)
                     piexif.insert(exif_bytes, file_dir + filename)
 
-        if (is_video):
-            # The following uses replace instead of rename since replace accounts for already existing files
-            actual_date = utc_to_pt(creation_time, "%Y-%m-%d %H.%M.%S")
-            os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.find('.'):])
-        elif (no_exif):
-            actual_date = utc_to_pt(creation_time)
+        if (no_exif):
             exif_dict = {
                 "0th": {},
                 "Exif": {
@@ -261,24 +272,34 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 "thumbnail": None
             }
             exif_bytes = piexif.dump(exif_dict)
-            #Note this will remove most of the metadata. Might change this to use exiftool.
-            #Exiftool takes longer to execute thus piexif is still used.
             im.save(file_dir + filename, exif=exif_bytes)
-            im.close() #Could duplicate this over to other parts
+            im.close()
             #Only way to properly change the PNG time which is used by Windows instead of the new EXIF for some reason.
-            #Still need to test this on other files with no EXIF (e.g JPG and HEIC).
-            subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir+filename],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if(filename.find("PNG")):
+                subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir+filename],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
+        # The following uses replace instead of rename since replace accounts for already existing files
+        im.close()
+        actual_date = datetime.strptime(actual_date,"%Y:%m:%d %H:%M:%S").strftime("%Y-%m-%d %H.%M.%S")
+        os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.rfind('.'):])
         bar()
 
 if(list_no_exif):
-    print(f"The following images had no EXIF data and data was created automatically")
+    print(f"\nThe following image{'s' if (len(list_no_exif) > 1) else ''} had no EXIF data and data was created automatically:")
     for i in range(len(list_no_exif)):
         print(list_no_exif[i][0] + "-> Date Taken: " + list_no_exif[i][1])
-    print("NOTE: PNG images may use the tag of CreationTime instead of the supplied EXIF. This is accounted for.")
+if(list_no_album):
+    print(
+        f"The following image{'s' if (len(list_no_exif) > 1) else ''} did not belong to any album and {'were' if (len(list_no_exif) > 1) else 'was'} not organized:")
+    for i in range(len(list_no_album)):
+        print(list_no_album[i])
+print("NOTE: PNG images may use the tag of CreationTime instead of the supplied EXIF. This is accounted for.")
 
+# last_updated_id = photos[0]['id']
 
+# with open('newest_id_file.txt','w') as f:
+#     f.write(last_updated_id)
 
 
 

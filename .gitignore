@@ -2,3 +2,4 @@ credentials.json
 newest_id_file.txt
 token.pickle
 .env
+albums_sizes.json
