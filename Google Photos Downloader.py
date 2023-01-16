@@ -17,14 +17,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 #TO DO:
-#-Automatic sorting of photos to respective folders (env file).
-#-Add code that detects if old photos were added (old meaning they are older datewise than the most recent photo).
-# This could just be a photo between the most photo and the photo recorded by the last_updated index.
-#-Implement album json file check which stores sizes of albums and checks if their sizes have changed. Should speed up things
-#-Code cleanup.
-
-#Possible Implementations:
-#-GUI (ABSOLUTE LAST)
+#-Deal with case where items exceed pageSize when getting photos. Idea is to ask user for date where they wish to pull photos from. 
+# *Can replicate the generator function for the album code.
+# *Eliminates the need for the last updated index file.
+# *Might speed things up in the album loading if we just yield until the date is passed.
 
 load_dotenv()
 
@@ -77,7 +73,7 @@ if not creds or not creds.valid:
         pickle.dump(creds, token)
 
 service = build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
-request = service.mediaItems().list(pageSize=30) #Can modify as needed. Assumes only 30 new photos have been uploaded.
+request = service.mediaItems().list(pageSize=30) #Must modify this using nextpage token
 response = request.execute()
 
 photos = response['mediaItems']
@@ -96,11 +92,15 @@ for index, dic in enumerate(photos):
     else:
         last_updated_index = -1
 
-print(last_updated_index)
+# print(last_updated_index) #DEBUG LINE
 if(last_updated_index == 0):
     print("No new photos have been uploaded. Script exited.")
     sys.exit()
-    
+
+# Experimental code for updating based on a date instead of relying on a set thing.
+# last_updated_index = next((index for (index, d) in enumerate(reversed(photos)) if "2022-09-03" in d['mediaMetadata']['creationTime']), None)
+# print(len(photos) - last_updated_index -1)
+
 photos = photos[:last_updated_index+1]
 
 #Patch for albumId not being a valid arg: https://github.com/googleapis/google-api-python-client/issues/733
@@ -139,33 +139,41 @@ albums_of_new_photos = []
 
 album_media = []
 
-album_size_dict = {}
+# album_size_dict_old = {}
 
-if(os.path.exists('albums_sizes.json')):
-    with open('albums_sizes.json', 'r') as f:
-        album_size_dict = json.load(f)
-else:
-    for i in range(len(albums)):
-        album_size_dict[albums[i]['id']] = albums[i]['mediaItemsCount']
-    with open('albums_sizes.json', 'w') as f:
-        json.dump(album_size_dict,f)
-        
+# if(os.path.exists('albums_sizes.json')):
+#     with open('albums_sizes.json', 'r') as f:
+#         album_size_dict_old = json.load(f)
+# else:
+#     for i in range(len(albums)):
+#         album_size_dict_old[albums[i]['id']] = albums[i]['mediaItemsCount']
+#     with open('albums_sizes.json', 'w') as f:
+#         json.dump(album_size_dict_old,f)
+
+# album_size_dict_new = {}
+
+# for i in range(len(albums)):
+#     album_size_dict_new[albums[i]['id']] = albums[i]['mediaItemsCount']
+
+# set1 = set(album_size_dict_old.items())
+# set2 = set(album_size_dict_new.items())
+
+# print((set1 ^ set2) -set2) 
 
 #Get a list of photos from each album and put them in a list.
 with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
 
     for i in range(len(albums)):
         bar.text = '-> Loading album content, please wait...'
-        album_content = []
 
-        for content in get_photos(service, albums[i]['id'],20):
-            album_content.append(content)
+        album_content = [content for content in get_photos(service, albums[i]['id'],20)]
     
         album_media.append(album_content)
         bar()
  
 album_titles = [] #List of album titles that a certain photo belongs to.
 
+#Iterate through all albums and check which ones a photo belongs to.
 for i in range(last_updated_index+2): # Iterate through each photo.
 
     #Add the list of album titles that a photo is in to the total list of albums with each index being the index of the photo.
@@ -200,9 +208,8 @@ for i in range(last_updated_index+2): # Iterate through each photo.
             break
 
 #Takes care of duo photos here instead of the loop due to ordering issues
+# print(albums_of_new_photos) #DEBUG LINE
 albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_of_new_photos]
-
-file_dir = 'C:\\Users\\Tristan Huen\\Desktop\\Temp\\'
 
 list_no_exif = []
 list_no_album = []
@@ -227,20 +234,23 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
         no_exif = False
         no_album = False
         filename = photos[i]['filename']
+        file_dir = os.getenv('PHOTO_DIRECTORY')
+        folder_name = albums_of_new_photos[i]
         creation_time = photos[i]['mediaMetadata']['creationTime']
         actual_date = utc_to_pt(creation_time)
 
-        if (albums_of_new_photos[i] == "Not in any album"):
+        if (folder_name == "Not in any album"):
             list_no_album.append(filename)
+            folder_name = 'Not Organized'
 
-        with open(file_dir + filename, 'wb') as f:
+        with open(file_dir + folder_name + '\\' + filename, 'wb') as f:
             f.write(photo)
 
-            if (albums_of_new_photos[i] == "Videos"):
+            if (folder_name == "Videos"):
                 is_video = True
                 pass
             else:
-                im = Image.open(file_dir + filename)
+                im = Image.open(file_dir + folder_name + '\\' + filename)
 
                 try:
                     exif_dict = im.info['exif']
@@ -250,14 +260,14 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 else:
                     # Apply correct date from metadata
                     exif_dict = piexif.load(exif_dict)
-                    piexif.remove(file_dir + filename)
+                    piexif.remove(file_dir + folder_name + '\\' + filename)
                     encoded_date = actual_date.encode('utf-8')
                     exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = encoded_date
                     exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = encoded_date
 
                     # Apply changes to photos
                     exif_bytes = piexif.dump(exif_dict)
-                    piexif.insert(exif_bytes, file_dir + filename)
+                    piexif.insert(exif_bytes, file_dir + folder_name + '\\' + filename)
 
         if (no_exif):
             exif_dict = {
@@ -272,21 +282,21 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
                 "thumbnail": None
             }
             exif_bytes = piexif.dump(exif_dict)
-            im.save(file_dir + filename, exif=exif_bytes)
+            im.save(file_dir + folder_name + '\\' +filename, exif=exif_bytes)
             im.close()
             #Only way to properly change the PNG time which is used by Windows instead of the new EXIF for some reason.
             if(filename.find("PNG")):
-                subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir+filename],
+                subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir + folder_name + '\\' + filename],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # The following uses replace instead of rename since replace accounts for already existing files
         im.close()
         actual_date = datetime.strptime(actual_date,"%Y:%m:%d %H:%M:%S").strftime("%Y-%m-%d %H.%M.%S")
-        os.replace(file_dir + filename, file_dir + '\\' + actual_date + filename[filename.rfind('.'):])
+        os.replace(file_dir + folder_name + '\\' + filename, file_dir +  folder_name + '\\' + actual_date + filename[filename.rfind('.'):])
         bar()
 
 if(list_no_exif):
-    print(f"\nThe following image{'s' if (len(list_no_exif) > 1) else ''} had no EXIF data and data was created automatically:")
+    print(f"The following image{'s' if (len(list_no_exif) > 1) else ''} had no EXIF data and data was created automatically:")
     for i in range(len(list_no_exif)):
         print(list_no_exif[i][0] + "-> Date Taken: " + list_no_exif[i][1])
 if(list_no_album):
