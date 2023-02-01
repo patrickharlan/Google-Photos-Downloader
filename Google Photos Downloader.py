@@ -9,6 +9,7 @@ import requests
 import piexif
 import pytz
 from PIL import Image
+from typing import Iterator
 from datetime import datetime
 from alive_progress import alive_bar
 from dotenv import load_dotenv 
@@ -17,31 +18,31 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 #TO DO:
-#-Deal with case where items exceed pageSize when getting photos. Idea is to ask user for date where they wish to pull photos from. 
-# *Can replicate the generator function for the album code.
-# *Eliminates the need for the last updated index file.
-# *Might speed things up in the album loading if we just yield until the date is passed.
+#-Deal with case where items exceed pageSize when getting photos. Idea is to ask user for date where they wish to pull photos from. (Use generator)
+#-Also do the above for albums (good for generalization)
+#-Possibly using multithreading or multiprocessing for speedups. Only issue to look out for is thread safety.
 
 load_dotenv()
 
-#Generator that yields a photo from an album.
-def get_photos(service, album_id, page_size):
-    params = {'albumId':album_id, 'pageSize':page_size}
+def utc_to_pt(utc_string:'str',format="%Y:%m:%d %H:%M:%S",return_obj:'bool'=False) -> str | datetime:
+    """
+    Converts UTC date to PT date accounting for daylight savings
+  
+    Converts a string in a specific UTC date format to a PT date in a given format. 
+    Accounts for daylight savings (PST and PDT).
+  
+    Parameters
+    ----------
+    utc_string (string): UTC date whose format is %Y-%m-%dT%H:%M:%SZ.
+    format (string), optional: The string date format of the returned PT date.
+    return_obj (boolean), optional: If true then it will return the PT date as a datetime object. Else it will
+                                   return it as a string.
+  
+    Returns
+    ----------
+    pt_date (string/datetime.datetime): A date in the pacific timezone as a string or a datetime object.
+    """
 
-    while True:
-        request = service.mediaItems().search(**params)
-        response = request.execute()
-
-        for content in response['mediaItems']:
-            yield content
-        
-        params['pageToken'] = response.get('nextPageToken')
-
-        if response.get('nextPageToken') is None:
-            break
-
-#Converts UTC date to PT date with specific date format. Accounts for daylight savings
-def utc_to_pt(utc_string,format="%Y:%m:%d %H:%M:%S"):
     utc_timezone = pytz.timezone("UTC")
     date = utc_timezone.localize(datetime.strptime(utc_string, "%Y-%m-%dT%H:%M:%SZ"))
 
@@ -50,7 +51,54 @@ def utc_to_pt(utc_string,format="%Y:%m:%d %H:%M:%S"):
     #Convert UTC to PT
     pt_date = date.astimezone(pt_timezone)
 
-    return pt_date.strftime(format)
+    if(return_obj):
+        return pt_date
+    else:
+        return pt_date.strftime(format)
+
+
+#NOTE: Change name to better reflect function.
+#NOTE: Photos in each album must either be correctly sorted as newest first or oldest first. 
+# The code might still work without it but there are no guarantees.
+def get_photos(service, album_id, page_size, start_date = datetime(2022,8,24)) -> Iterator[dict]: 
+    """
+    Generator for getting all photos from an album
+  
+    Generator function which uses the nextPageToken to get all photos from a given album starting from a given date.
+  
+    Parameters
+    ----------
+    service : The resource API object.
+    album_id (string): The album's ID obtained from using the service object.
+    page_size (int): Maximum number of media items to return in the response.
+    start_date (datetime.datetime), optional: The starting date from which photos will be obtained.
+  
+    Returns
+    ----------
+    An iterator of the dictionary type.
+    """
+
+    params = {'albumId':album_id, 'pageSize':page_size}
+
+    photo_date = None
+
+    start_date = pytz.UTC.localize(start_date)
+
+    while True:
+        request = service.mediaItems().search(**params)
+        response = request.execute()
+
+        for content in response['mediaItems']:
+            photo_date = utc_to_pt(content['mediaMetadata']['creationTime'],return_obj=True)
+            if(photo_date < start_date):
+                return
+            yield content
+            
+        params['pageToken'] = response.get('nextPageToken')
+
+        if (response.get('nextPageToken') is None):
+            break
+
 
 #AUTH Code Found Here: https://stackoverflow.com/questions/58928685/google-photos-api-python-working-non-deprecated-example
 
@@ -73,7 +121,7 @@ if not creds or not creds.valid:
         pickle.dump(creds, token)
 
 service = build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
-request = service.mediaItems().list(pageSize=30) #Must modify this using nextpage token
+request = service.mediaItems().list(pageSize=100) #NOTE:Must modify this using nextpage token
 response = request.execute()
 
 photos = response['mediaItems']
@@ -96,10 +144,6 @@ for index, dic in enumerate(photos):
 if(last_updated_index == 0):
     print("No new photos have been uploaded. Script exited.")
     sys.exit()
-
-# Experimental code for updating based on a date instead of relying on a set thing.
-# last_updated_index = next((index for (index, d) in enumerate(reversed(photos)) if "2022-09-03" in d['mediaMetadata']['creationTime']), None)
-# print(len(photos) - last_updated_index -1)
 
 photos = photos[:last_updated_index+1]
 
@@ -128,7 +172,7 @@ search_params = {
   }
 }
 
-request = service.albums().list(pageSize=30) #Only need 30 items since there are only 28 albums currently. Might change this later to reflect pageToken stuff.
+request = service.albums().list(pageSize=30) #Only need 30 items since there are only 28 albums currently. This will most likely be changed in favour of a generator.
 response = request.execute()
 
 albums = response['albums']
@@ -138,27 +182,6 @@ service._resourceDesc['resources']['mediaItems']['methods']['search']['parameter
 albums_of_new_photos = []
 
 album_media = []
-
-# album_size_dict_old = {}
-
-# if(os.path.exists('albums_sizes.json')):
-#     with open('albums_sizes.json', 'r') as f:
-#         album_size_dict_old = json.load(f)
-# else:
-#     for i in range(len(albums)):
-#         album_size_dict_old[albums[i]['id']] = albums[i]['mediaItemsCount']
-#     with open('albums_sizes.json', 'w') as f:
-#         json.dump(album_size_dict_old,f)
-
-# album_size_dict_new = {}
-
-# for i in range(len(albums)):
-#     album_size_dict_new[albums[i]['id']] = albums[i]['mediaItemsCount']
-
-# set1 = set(album_size_dict_old.items())
-# set2 = set(album_size_dict_new.items())
-
-# print((set1 ^ set2) -set2) 
 
 #Get a list of photos from each album and put them in a list.
 with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
@@ -170,7 +193,7 @@ with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
     
         album_media.append(album_content)
         bar()
- 
+
 album_titles = [] #List of album titles that a certain photo belongs to.
 
 #Iterate through all albums and check which ones a photo belongs to.
@@ -208,7 +231,7 @@ for i in range(last_updated_index+2): # Iterate through each photo.
             break
 
 #Takes care of duo photos here instead of the loop due to ordering issues
-# print(albums_of_new_photos) #DEBUG LINE
+#print(albums_of_new_photos) #DEBUG LINE
 albums_of_new_photos  = ["Group Stuff" if len(l) == 2 else l[0] for l in albums_of_new_photos]
 
 list_no_exif = []
@@ -248,7 +271,6 @@ with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=
 
             if (folder_name == "Videos"):
                 is_video = True
-                pass
             else:
                 im = Image.open(file_dir + folder_name + '\\' + filename)
 
