@@ -8,6 +8,8 @@ import os
 import requests
 import piexif
 import pytz
+import concurrent.futures
+import threading
 from PIL import Image
 from typing import Iterator
 from datetime import datetime
@@ -56,11 +58,10 @@ def utc_to_pt(utc_string:'str',format="%Y:%m:%d %H:%M:%S",return_obj:'bool'=Fals
     else:
         return pt_date.strftime(format)
 
-
-#NOTE: Change name to better reflect function.
+#Normally dates would work using the filters param but albumId can't be set in conjunction with any filters.
 #NOTE: Photos in each album must either be correctly sorted as newest first or oldest first. 
 # The code might still work without it but there are no guarantees.
-def get_photos(service, album_id, page_size, start_date = datetime(2022,8,24)) -> Iterator[dict]: 
+def get_media(service, params, start_date = datetime(2022,8,24)) -> Iterator[dict]: 
     """
     Generator for getting all photos from an album
   
@@ -78,13 +79,12 @@ def get_photos(service, album_id, page_size, start_date = datetime(2022,8,24)) -
     An iterator of the dictionary type.
     """
 
-    params = {'albumId':album_id, 'pageSize':page_size}
-
     photo_date = None
 
     start_date = pytz.UTC.localize(start_date)
 
     while True:
+
         request = service.mediaItems().search(**params)
         response = request.execute()
 
@@ -99,6 +99,55 @@ def get_photos(service, album_id, page_size, start_date = datetime(2022,8,24)) -
         if (response.get('nextPageToken') is None):
             break
 
+def get_album_thread(creds,album:dict)-> list[dict]:
+    """
+    Thread function for getting album
+  
+    Function to be used in ThreadPoolExecutor to get album content.
+  
+    Parameters
+    ----------
+    creds : Credentials object used by Google for building a service object.
+    album (dict): A dictionary containing information about the album. Most important key:value is 'id'.
+  
+    Returns
+    ----------
+    media_content (list): A list of dictionaries representing each photo in the album
+    """
+
+    #The service object is naturally not thread-safe so we make one for each worker.
+    service = build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
+
+    search_params = {
+        "albumId": {
+            "description": "Identifier of an album. If populated, lists all media items in specified album. Can't set in conjunction with any filters.",
+            "location": "query",
+            "type": "string"
+        },
+        "pageSize": {
+            "description": "Maximum number of media items to return in the response. Fewer media items might be returned than the specified number. The default pageSize is 25, the maximum is 100.",
+            "location": "query",
+            "type": "integer",
+            "format": "int32"
+        },
+        "pageToken": {
+            "description": "A continuation token to get the next page of the results. Adding this to the request returns the rows after the pageToken. The pageToken should be the value returned in the nextPageToken parameter in the response to the searchMediaItems request.",
+            "location": "query",
+            "type": "string"
+        },
+        "filters": {
+            "description": "Filters to apply to the request. Can't be set in conjunction with an albumId.",
+            "location": "query",
+            "type": "object"
+        }
+    }
+
+    service._resourceDesc['resources']['mediaItems']['methods']['search']['parameters'].update(search_params)
+
+    album_id = album['id']
+    media_content = [content for content in get_media(service,{'albumId':album['id'], 'pageSize':20})]
+    media_content.insert(0,album_id) #Multithreading does not guarantee order so we use the album id for reordering later.
+    return media_content
 
 #AUTH Code Found Here: https://stackoverflow.com/questions/58928685/google-photos-api-python-working-non-deprecated-example
 
@@ -121,31 +170,6 @@ if not creds or not creds.valid:
         pickle.dump(creds, token)
 
 service = build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
-request = service.mediaItems().list(pageSize=100) #NOTE:Must modify this using nextpage token
-response = request.execute()
-
-photos = response['mediaItems']
-
-last_updated_index = None
-last_updated_id = None
-
-with open('newest_id_file.txt') as f:
-    last_updated_id = f.read()
-
-#Find the index of the last updated photo. The first element in photos is the most recent photo
-for index, dic in enumerate(photos):
-    if dic['id'] == last_updated_id:
-        last_updated_index = index
-        break
-    else:
-        last_updated_index = -1
-
-# print(last_updated_index) #DEBUG LINE
-if(last_updated_index == 0):
-    print("No new photos have been uploaded. Script exited.")
-    sys.exit()
-
-photos = photos[:last_updated_index+1]
 
 #Patch for albumId not being a valid arg: https://github.com/googleapis/google-api-python-client/issues/733
 search_params = {
@@ -172,32 +196,49 @@ search_params = {
   }
 }
 
+service._resourceDesc['resources']['mediaItems']['methods']['search']['parameters'].update(search_params)
+
+photos = [content for content in get_media(service,{'pageSize':20})]
+
 request = service.albums().list(pageSize=30) #Only need 30 items since there are only 28 albums currently. This will most likely be changed in favour of a generator.
 response = request.execute()
 
 albums = response['albums']
 
-service._resourceDesc['resources']['mediaItems']['methods']['search']['parameters'].update(search_params)
+#print(albums)
+
+album_id_list = [album['id'] for album in albums]
+
+print(album_id_list)
 
 albums_of_new_photos = []
 
 album_media = []
 
-#Get a list of photos from each album and put them in a list.
-with alive_bar(len(albums), dual_line=True, title='Albums',calibrate=10) as bar:
+#Don't think with_alive progress supports multithreading. Another alternative such as tqdm may be possible.
+start = time.time()
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    futures = [executor.submit(get_album_thread, creds,album) for album in albums]
+    concurrent.futures.wait(futures)
 
-    for i in range(len(albums)):
-        bar.text = '-> Loading album content, please wait...'
+    # Wait for all tasks to finish
+    for future in concurrent.futures.as_completed(futures):
+        result = future.result()
+        album_media.append(result)
 
-        album_content = [content for content in get_photos(service, albums[i]['id'],20)]
-    
-        album_media.append(album_content)
-        bar()
+print(time.time() - start)
+
+#The album_media is out of order so we can use the album_id_list to reorder it based 
+album_media = sorted(album_media, key=lambda element: album_id_list.index(element[0]))
+
+#Don't need the album_id anymore.
+for list_element in album_media:
+    del list_element[0]
 
 album_titles = [] #List of album titles that a certain photo belongs to.
 
 #Iterate through all albums and check which ones a photo belongs to.
-for i in range(last_updated_index+2): # Iterate through each photo.
+for i in range(len(photos)+1): # Iterate through each photo.
 
     #Add the list of album titles that a photo is in to the total list of albums with each index being the index of the photo.
     if(album_titles and i > 0):
@@ -210,7 +251,7 @@ for i in range(last_updated_index+2): # Iterate through each photo.
     album_titles = [] #Reset after each iteration
 
     #Required since the last iteration will be skipped (hence the last_updated_index+2 in the above).
-    if(i == last_updated_index+1):
+    if(i == len(photos)):
         break
 
     for j in range(len(albums)): # Iterate through each album
@@ -238,8 +279,8 @@ list_no_exif = []
 list_no_album = []
 
 #Download all photos/videos and change the dates/titles for them to match up
-with alive_bar(last_updated_index+1,  dual_line=True, title='Photos', calibrate=10) as bar:
-    for i in range(last_updated_index+1):
+with alive_bar(len(photos),  dual_line=True, title='Photos', calibrate=10) as bar:
+    for i in range(len(photos)):
         bar.text = "-> Downloading photos, please wait..."
         request = service.mediaItems().get(mediaItemId=photos[i]['id'])
         response = request.execute()
@@ -327,11 +368,6 @@ if(list_no_album):
     for i in range(len(list_no_album)):
         print(list_no_album[i])
 print("NOTE: PNG images may use the tag of CreationTime instead of the supplied EXIF. This is accounted for.")
-
-# last_updated_id = photos[0]['id']
-
-# with open('newest_id_file.txt','w') as f:
-#     f.write(last_updated_id)
 
 
 
