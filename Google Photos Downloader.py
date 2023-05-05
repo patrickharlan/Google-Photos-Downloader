@@ -10,7 +10,7 @@ import concurrent.futures
 from PIL import Image
 from typing import Iterator
 from datetime import datetime
-from alive_progress import alive_bar
+from tqdm import tqdm
 from dotenv import load_dotenv 
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -21,7 +21,7 @@ from google.auth.transport.requests import Request
 
 load_dotenv()
 
-def utc_to_pt(utc_string:'str',format="%Y:%m:%d %H:%M:%S",return_obj:'bool'=False) -> str | datetime:
+def utc_to_pt(utc_string:'str',format:'str'="%Y:%m:%d %H:%M:%S",return_obj:'bool'=False) -> str | datetime:
     """
     Converts UTC date to PT date accounting for daylight savings
   
@@ -225,7 +225,7 @@ print(time.time() - start)
 
 #The album_media is out of order so we can use the album_id_list to reorder it based 
 album_media = sorted(album_media, key=lambda element: album_id_list.index(element[0]))
-print(album_media)
+# print(album_media)
 
 #Don't need the album_id anymore.
 for list_element in album_media:
@@ -274,90 +274,87 @@ for photo in photos:
     else:
         photo['album'] = titles
 
-#print(photos)
+# print(photos)
 
 list_no_exif = []
 list_no_album = []
+file_dir = os.getenv('PHOTO_DIRECTORY')
 
 #Download all photos/videos and change the dates/titles for them to match up
-with alive_bar(len(photos),  dual_line=True, title='Photos', calibrate=10) as bar:
-    for photo in photos:
-        bar.text = "-> Downloading photos, please wait..."
-        request = service.mediaItems().get(mediaItemId=photo['id'])
-        response = request.execute()
+for photo in tqdm(photos, desc = "-> Downloading please wait..."):
+    request = service.mediaItems().get(mediaItemId=photo['id'])
+    response = request.execute()
 
-        #The '=dv' and '=d' download the videos and photos respectively in full quality and properly
-        if (photo['album'] == "Videos"):
-            media_url = response['baseUrl'] + '=dv'
+    #The '=dv' and '=d' download the videos and photos respectively in full quality and properly
+    if (photo['album'] == "Videos"):
+        media_url = response['baseUrl'] + '=dv'
+    else:
+        media_url = response['baseUrl'] + '=d'
+
+    response = requests.get(media_url)
+    photo_bytes = response.content
+
+    is_video = False
+    no_exif = False
+    no_album = False
+    filename = photo['filename']
+    folder_name = photo['album']
+    creation_time = photo['mediaMetadata']['creationTime']
+    actual_date = utc_to_pt(creation_time)
+
+    if (folder_name == "Not in any album"):
+        list_no_album.append(filename)
+        folder_name = 'Not Organized'
+
+    with open(file_dir + folder_name + '\\' + filename, 'wb') as f:
+        f.write(photo_bytes)
+
+        if (folder_name == "Videos"):
+            is_video = True
         else:
-            media_url = response['baseUrl'] + '=d'
+            im = Image.open(file_dir + folder_name + '\\' + filename)
 
-        response = requests.get(media_url)
-        photo_bytes = response.content
-
-        is_video = False
-        no_exif = False
-        no_album = False
-        filename = photo['filename']
-        file_dir = os.getenv('PHOTO_DIRECTORY')
-        folder_name = photo['album']
-        creation_time = photo['mediaMetadata']['creationTime']
-        actual_date = utc_to_pt(creation_time)
-
-        if (folder_name == "Not in any album"):
-            list_no_album.append(filename)
-            folder_name = 'Not Organized'
-
-        with open(file_dir + folder_name + '\\' + filename, 'wb') as f:
-            f.write(photo_bytes)
-
-            if (folder_name == "Videos"):
-                is_video = True
+            try:
+                exif_dict = im.info['exif']
+            except KeyError:  # Some photos may not have EXIF data
+                list_no_exif.append((filename, actual_date))
+                no_exif = True
             else:
-                im = Image.open(file_dir + folder_name + '\\' + filename)
+                # Apply correct date from metadata
+                exif_dict = piexif.load(exif_dict)
+                piexif.remove(file_dir + folder_name + '\\' + filename)
+                encoded_date = actual_date.encode('utf-8')
+                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = encoded_date
+                exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = encoded_date
 
-                try:
-                    exif_dict = im.info['exif']
-                except KeyError:  # Some photos may not have EXIF data
-                    list_no_exif.append((filename, actual_date))
-                    no_exif = True
-                else:
-                    # Apply correct date from metadata
-                    exif_dict = piexif.load(exif_dict)
-                    piexif.remove(file_dir + folder_name + '\\' + filename)
-                    encoded_date = actual_date.encode('utf-8')
-                    exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = encoded_date
-                    exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = encoded_date
+                # Apply changes to photos
+                exif_bytes = piexif.dump(exif_dict)
+                piexif.insert(exif_bytes, file_dir + folder_name + '\\' + filename)
 
-                    # Apply changes to photos
-                    exif_bytes = piexif.dump(exif_dict)
-                    piexif.insert(exif_bytes, file_dir + folder_name + '\\' + filename)
-
-        if (no_exif):
-            exif_dict = {
-                "0th": {},
-                "Exif": {
-                    piexif.ExifIFD.DateTimeOriginal: actual_date,
-                    piexif.ExifIFD.DateTimeDigitized: actual_date
-                },
-                "GPS": {},
-                "Interop": {},
-                "1st": {},
-                "thumbnail": None
-            }
-            exif_bytes = piexif.dump(exif_dict)
-            im.save(file_dir + folder_name + '\\' +filename, exif=exif_bytes)
-            im.close()
-            #Only way to properly change the PNG time which is used by Windows instead of the new EXIF for some reason.
-            if(filename.find("PNG")):
-                subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir + folder_name + '\\' + filename],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # The following uses replace instead of rename since replace accounts for already existing files
+    if (no_exif):
+        exif_dict = {
+            "0th": {},
+            "Exif": {
+                piexif.ExifIFD.DateTimeOriginal: actual_date,
+                piexif.ExifIFD.DateTimeDigitized: actual_date
+            },
+            "GPS": {},
+            "Interop": {},
+            "1st": {},
+            "thumbnail": None
+        }
+        exif_bytes = piexif.dump(exif_dict)
+        im.save(file_dir + folder_name + '\\' +filename, exif=exif_bytes)
         im.close()
-        actual_date = datetime.strptime(actual_date,"%Y:%m:%d %H:%M:%S").strftime("%Y-%m-%d %H.%M.%S")
-        os.replace(file_dir + folder_name + '\\' + filename, file_dir +  folder_name + '\\' + actual_date + filename[filename.rfind('.'):])
-        bar()
+        #Only way to properly change the PNG time which is used by Windows instead of the new EXIF for some reason.
+        if(filename.find("PNG")):
+            subprocess.run(["exiftool", "-overwrite_original", f"-PNG:CreationTime={actual_date}", file_dir + folder_name + '\\' + filename],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # The following uses replace instead of rename since replace accounts for already existing files
+    im.close()
+    actual_date = datetime.strptime(actual_date,"%Y:%m:%d %H:%M:%S").strftime("%Y-%m-%d %H.%M.%S")
+    os.replace(file_dir + folder_name + '\\' + filename, file_dir +  folder_name + '\\' + actual_date + filename[filename.rfind('.'):])
 
 if(list_no_exif):
     print(f"The following image{'s' if (len(list_no_exif) > 1) else ''} had no EXIF data and data was created automatically:")
